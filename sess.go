@@ -17,8 +17,6 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
 )
 
 const (
@@ -437,27 +435,6 @@ func (s *UDPSession) SetNoDelay(nodelay, interval, resend, nc int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.kcp.NoDelay(nodelay, interval, resend, nc)
-}
-
-// SetDSCP sets the 6bit DSCP field of IP header
-func (s *UDPSession) SetDSCP(dscp int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if nc, ok := s.conn.(net.Conn); ok {
-		addr, err := net.ResolveUDPAddr("udp", nc.LocalAddr().String())
-		if err == nil {
-			if addr.IP.To4() != nil {
-				return ipv4.NewConn(nc).SetTOS(dscp << 2)
-			} else {
-				return ipv6.NewConn(nc).SetTrafficClass(dscp)
-			}
-		}
-		if err := ipv4.NewConn(nc).SetTOS(dscp << 2); err != nil {
-			return ipv6.NewConn(nc).SetTrafficClass(dscp)
-		}
-		return nil
-	}
-	return errInvalidOperation
 }
 
 // SetReadBuffer sets the socket read buffer
