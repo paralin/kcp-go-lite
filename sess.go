@@ -443,41 +443,6 @@ func (s *UDPSession) SetNoDelay(nodelay, interval, resend, nc int) {
 	s.kcp.NoDelay(nodelay, interval, resend, nc)
 }
 
-// SetDSCP sets the 6bit DSCP field in IPv4 header, or 8bit Traffic Class in IPv6 header.
-//
-// if the underlying connection has implemented `func SetDSCP(int) error`, SetDSCP() will invoke
-// this function instead.
-//
-// It has no effect if it's accepted from Listener.
-func (s *UDPSession) SetDSCP(dscp int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// interface enabled
-	if ts, ok := s.conn.(setDSCP); ok {
-		return ts.SetDSCP(dscp)
-	}
-
-	if nc, ok := s.conn.(net.Conn); ok {
-		var succeed bool
-		if err := ipv4.NewConn(nc).SetTOS(dscp << 2); err == nil {
-			succeed = true
-		}
-		if err := ipv6.NewConn(nc).SetTrafficClass(dscp); err == nil {
-			succeed = true
-		}
-
-		if succeed {
-			return nil
-		}
-		if err := ipv4.NewConn(nc).SetTOS(dscp << 2); err != nil {
-			return ipv6.NewConn(nc).SetTrafficClass(dscp)
-		}
-		return nil
-	}
-	return errInvalidOperation
-}
-
 // SetReadBuffer sets the socket read buffer
 func (s *UDPSession) SetReadBuffer(bytes int) error {
 	s.mu.Lock()
