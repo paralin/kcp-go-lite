@@ -59,10 +59,9 @@ func init() {
 type (
 	// UDPSession defines a KCP session implemented by UDP
 	UDPSession struct {
-		updaterIdx int            // record slice index in updater
-		conn       net.PacketConn // the underlying packet connection
-		kcp        *KCP           // KCP ARQ protocol
-		block      BlockCrypt     // block encryption object
+		updaterIdx int        // record slice index in updater
+		kcp        *KCP       // KCP ARQ protocol
+		block      BlockCrypt // block encryption object
 
 		// kcp receiving is based on packets
 		// recvbuf turns packets into stream
@@ -76,7 +75,6 @@ type (
 		fecEncoder *fecEncoder
 
 		// settings
-		remote     net.Addr  // remote peer address
 		rd         time.Time // read deadline
 		wd         time.Time // write deadline
 		headerSize int       // the header size additional to a KCP frame
@@ -88,7 +86,6 @@ type (
 		die          chan struct{} // notify current session has Closed
 		chReadEvent  chan struct{} // notify Read() can be called without blocking
 		chWriteEvent chan struct{} // notify Write() can be called without blocking
-		chReadError  chan error    // notify PacketConn.Read() have an error
 		chWriteError chan error    // notify PacketConn.Write() have an error
 
 		// nonce generator
@@ -96,6 +93,8 @@ type (
 
 		isClosed bool // flag the session has Closed
 		mu       sync.Mutex
+
+		writer func(b []byte) (n int, err error)
 	}
 
 	setReadBuffer interface {
@@ -108,17 +107,21 @@ type (
 )
 
 // NewUDPSession create a new udp session for client or server
-func NewUDPSession(conv uint32, dataShards, parityShards int, conn net.PacketConn, remote net.Addr, block BlockCrypt) *UDPSession {
+func NewUDPSession(
+	writer func(b []byte) (n int, err error),
+	conv uint32,
+	dataShards,
+	parityShards int,
+	block BlockCrypt,
+) *UDPSession {
 	sess := new(UDPSession)
 	sess.die = make(chan struct{})
 	sess.nonce = new(nonceAES128)
+	sess.writer = writer
 	sess.nonce.Init()
 	sess.chReadEvent = make(chan struct{}, 1)
 	sess.chWriteEvent = make(chan struct{}, 1)
-	sess.chReadError = make(chan error, 1)
 	sess.chWriteError = make(chan error, 1)
-	sess.remote = remote
-	sess.conn = conn
 	sess.block = block
 	sess.recvbuf = make([]byte, mtuLimit)
 
@@ -154,7 +157,6 @@ func NewUDPSession(conv uint32, dataShards, parityShards int, conn net.PacketCon
 	// which call sess.update() periodically.
 	updater.addSession(sess)
 
-	go sess.readLoop()
 	currestab := atomic.AddUint64(&DefaultSnmp.CurrEstab, 1)
 	maxconn := atomic.LoadUint64(&DefaultSnmp.MaxConn)
 	if currestab > maxconn {
@@ -224,11 +226,6 @@ func (s *UDPSession) Read(b []byte) (n int, err error) {
 		case <-s.chReadEvent:
 		case <-c:
 		case <-s.die:
-		case err = <-s.chReadError:
-			if timeout != nil {
-				timeout.Stop()
-			}
-			return n, err
 		}
 
 		if timeout != nil {
@@ -313,14 +310,8 @@ func (s *UDPSession) Close() error {
 	close(s.die)
 	s.isClosed = true
 	atomic.AddUint64(&DefaultSnmp.CurrEstab, ^uint64(0))
-	return s.conn.Close()
+	return nil
 }
-
-// LocalAddr returns the local network address. The Addr returned is shared by all invocations of LocalAddr, so do not modify it.
-func (s *UDPSession) LocalAddr() net.Addr { return s.conn.LocalAddr() }
-
-// RemoteAddr returns the remote network address. The Addr returned is shared by all invocations of RemoteAddr, so do not modify it.
-func (s *UDPSession) RemoteAddr() net.Addr { return s.remote }
 
 // SetDeadline sets the deadline associated with the listener. A zero time value disables the deadline.
 func (s *UDPSession) SetDeadline(t time.Time) error {
@@ -412,21 +403,25 @@ func (s *UDPSession) SetNoDelay(nodelay, interval, resend, nc int) {
 
 // SetReadBuffer sets the socket read buffer
 func (s *UDPSession) SetReadBuffer(bytes int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if nc, ok := s.conn.(setReadBuffer); ok {
-		return nc.SetReadBuffer(bytes)
-	}
+	/*
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if nc, ok := s.conn.(setReadBuffer); ok {
+			return nc.SetReadBuffer(bytes)
+		}
+	*/
 	return errors.New(errInvalidOperation)
 }
 
 // SetWriteBuffer sets the socket write buffer, no effect if it's accepted from Listener
 func (s *UDPSession) SetWriteBuffer(bytes int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if nc, ok := s.conn.(setWriteBuffer); ok {
-		return nc.SetWriteBuffer(bytes)
-	}
+	/*
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if nc, ok := s.conn.(setWriteBuffer); ok {
+			return nc.SetWriteBuffer(bytes)
+		}
+	*/
 	return errors.New(errInvalidOperation)
 }
 
@@ -471,7 +466,7 @@ func (s *UDPSession) output(buf []byte) {
 	nbytes := 0
 	npkts := 0
 	for i := 0; i < s.dup+1; i++ {
-		if n, err := s.conn.WriteTo(ext, s.remote); err == nil {
+		if n, err := s.writer(ext); err == nil {
 			nbytes += n
 			npkts++
 		} else {
@@ -480,7 +475,7 @@ func (s *UDPSession) output(buf []byte) {
 	}
 
 	for k := range ecc {
-		if n, err := s.conn.WriteTo(ecc[k], s.remote); err == nil {
+		if n, err := s.writer(ecc[k]); err == nil {
 			nbytes += n
 			npkts++
 		} else {
@@ -610,47 +605,25 @@ func (s *UDPSession) kcpInput(data []byte) {
 	}
 }
 
-// the read loop for a client session
-func (s *UDPSession) readLoop() {
-	buf := make([]byte, mtuLimit)
-	var src string
-	for {
-		if n, addr, err := s.conn.ReadFrom(buf); err == nil {
-			// make sure the packet is from the same source
-			if src == "" { // set source address
-				src = addr.String()
-			} else if addr.String() != src {
-				atomic.AddUint64(&DefaultSnmp.InErrs, 1)
-				continue
-			}
-
-			if n >= s.headerSize+IKCP_OVERHEAD {
-				data := buf[:n]
-				dataValid := false
-				if s.block != nil {
-					s.block.Decrypt(data, data)
-					data = data[nonceSize:]
-					checksum := crc32.ChecksumIEEE(data[crcSize:])
-					if checksum == binary.LittleEndian.Uint32(data) {
-						data = data[crcSize:]
-						dataValid = true
-					} else {
-						atomic.AddUint64(&DefaultSnmp.InCsumErrors, 1)
-					}
-				} else if s.block == nil {
-					dataValid = true
-				}
-
-				if dataValid {
-					s.kcpInput(data)
-				}
-			} else {
-				atomic.AddUint64(&DefaultSnmp.InErrs, 1)
-			}
+// RxPacket processes an incoming packet.
+func (s *UDPSession) RxPacket(data []byte) {
+	dataValid := false
+	if s.block != nil {
+		s.block.Decrypt(data, data)
+		data = data[nonceSize:]
+		checksum := crc32.ChecksumIEEE(data[crcSize:])
+		if checksum == binary.LittleEndian.Uint32(data) {
+			data = data[crcSize:]
+			dataValid = true
 		} else {
-			s.chReadError <- err
-			return
+			atomic.AddUint64(&DefaultSnmp.InCsumErrors, 1)
 		}
+	} else if s.block == nil {
+		dataValid = true
+	}
+
+	if dataValid {
+		s.kcpInput(data)
 	}
 }
 
