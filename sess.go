@@ -59,10 +59,9 @@ func init() {
 type (
 	// UDPSession defines a KCP session implemented by UDP
 	UDPSession struct {
-		updaterIdx int            // record slice index in updater
-		conn       net.PacketConn // the underlying packet connection
-		kcp        *KCP           // KCP ARQ protocol
-		block      BlockCrypt     // block encryption object
+		updaterIdx int        // record slice index in updater
+		kcp        *KCP       // KCP ARQ protocol
+		block      BlockCrypt // block encryption object
 
 		// kcp receiving is based on packets
 		// recvbuf turns packets into stream
@@ -74,7 +73,6 @@ type (
 		fecEncoder *fecEncoder
 
 		// settings
-		remote     net.Addr  // remote peer address
 		rd         time.Time // read deadline
 		wd         time.Time // write deadline
 		headerSize int       // the header size additional to a KCP frame
@@ -105,6 +103,8 @@ type (
 		xconnWriteError error
 
 		mu sync.Mutex
+
+		writer func(b []byte) (n int, err error)
 	}
 
 	setReadBuffer interface {
@@ -117,17 +117,22 @@ type (
 )
 
 // NewUDPSession create a new udp session for client or server
-func NewUDPSession(conv uint32, dataShards, parityShards int, conn net.PacketConn, remote net.Addr, block BlockCrypt) *UDPSession {
+func NewUDPSession(
+	writer func(b []byte) (n int, err error),
+	conv uint32,
+	dataShards,
+	parityShards int,
+	block BlockCrypt,
+) *UDPSession {
 	sess := new(UDPSession)
 	sess.die = make(chan struct{})
 	sess.nonce = new(nonceAES128)
+	sess.writer = writer
 	sess.nonce.Init()
 	sess.chReadEvent = make(chan struct{}, 1)
 	sess.chWriteEvent = make(chan struct{}, 1)
 	sess.chSocketReadError = make(chan struct{})
 	sess.chSocketWriteError = make(chan struct{})
-	sess.remote = remote
-	sess.conn = conn
 	sess.block = block
 	sess.recvbuf = make([]byte, mtuLimit)
 
@@ -341,12 +346,6 @@ func (s *UDPSession) Close() error {
 	}
 }
 
-// LocalAddr returns the local network address. The Addr returned is shared by all invocations of LocalAddr, so do not modify it.
-func (s *UDPSession) LocalAddr() net.Addr { return s.conn.LocalAddr() }
-
-// RemoteAddr returns the remote network address. The Addr returned is shared by all invocations of RemoteAddr, so do not modify it.
-func (s *UDPSession) RemoteAddr() net.Addr { return s.remote }
-
 // SetDeadline sets the deadline associated with the listener. A zero time value disables the deadline.
 func (s *UDPSession) SetDeadline(t time.Time) error {
 	s.mu.Lock()
@@ -439,22 +438,26 @@ func (s *UDPSession) SetNoDelay(nodelay, interval, resend, nc int) {
 
 // SetReadBuffer sets the socket read buffer
 func (s *UDPSession) SetReadBuffer(bytes int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if nc, ok := s.conn.(setReadBuffer); ok {
-		return nc.SetReadBuffer(bytes)
-	}
-	return errInvalidOperation
+	/*
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if nc, ok := s.conn.(setReadBuffer); ok {
+			return nc.SetReadBuffer(bytes)
+		}
+	*/
+	return errors.New(errInvalidOperation)
 }
 
 // SetWriteBuffer sets the socket write buffer, no effect if it's accepted from Listener
 func (s *UDPSession) SetWriteBuffer(bytes int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if nc, ok := s.conn.(setWriteBuffer); ok {
-		return nc.SetWriteBuffer(bytes)
-	}
-	return errInvalidOperation
+	/*
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if nc, ok := s.conn.(setWriteBuffer); ok {
+			return nc.SetWriteBuffer(bytes)
+		}
+	*/
+	return errors.New(errInvalidOperation)
 }
 
 // post-processing for sending a packet from kcp core
@@ -656,7 +659,11 @@ func (s *UDPSession) kcpInput(data []byte) {
 	if fecRecovered > 0 {
 		atomic.AddUint64(&DefaultSnmp.FECRecovered, fecRecovered)
 	}
+}
 
+// RxPacket processes an incoming packet.
+func (s *UDPSession) RxPacket(data []byte) {
+	s.packetInput(data)
 }
 
 type (
