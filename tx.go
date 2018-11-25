@@ -4,17 +4,16 @@ import (
 	"sync/atomic"
 
 	"github.com/pkg/errors"
-	"golang.org/x/net/ipv4"
 )
 
-func (s *UDPSession) defaultTx(txqueue []ipv4.Message) {
+func (s *UDPSession) tx(txqueue [][]byte) {
 	nbytes := 0
 	npkts := 0
 	for k := range txqueue {
-		if n, err := s.conn.WriteTo(txqueue[k].Buffers[0], txqueue[k].Addr); err == nil {
+		if n, err := s.writer(txqueue[k]); err == nil {
 			nbytes += n
 			npkts++
-			xmitBuf.Put(txqueue[k].Buffers[0])
+			xmitBuf.Put(txqueue[k])
 		} else {
 			s.notifyWriteError(errors.WithStack(err))
 			break

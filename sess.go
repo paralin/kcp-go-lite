@@ -17,8 +17,6 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
 )
 
 const (
@@ -61,10 +59,9 @@ func init() {
 type (
 	// UDPSession defines a KCP session implemented by UDP
 	UDPSession struct {
-		updaterIdx int            // record slice index in updater
-		conn       net.PacketConn // the underlying packet connection
-		kcp        *KCP           // KCP ARQ protocol
-		block      BlockCrypt     // block encryption object
+		updaterIdx int        // record slice index in updater
+		kcp        *KCP       // KCP ARQ protocol
+		block      BlockCrypt // block encryption object
 
 		// kcp receiving is based on packets
 		// recvbuf turns packets into stream
@@ -76,7 +73,6 @@ type (
 		fecEncoder *fecEncoder
 
 		// settings
-		remote     net.Addr  // remote peer address
 		rd         time.Time // read deadline
 		wd         time.Time // write deadline
 		headerSize int       // the header size additional to a KCP frame
@@ -102,11 +98,11 @@ type (
 		nonce Entropy
 
 		// packets waiting to be sent on wire
-		txqueue         []ipv4.Message
-		xconn           batchConn // for x/net
-		xconnWriteError error
+		txqueue [][]byte
 
 		mu sync.Mutex
+
+		writer func(b []byte) (n int, err error)
 	}
 
 	setReadBuffer interface {
@@ -123,31 +119,24 @@ type (
 )
 
 // NewUDPSession create a new udp session for client or server
-func NewUDPSession(conv uint32, dataShards, parityShards int, conn net.PacketConn, remote net.Addr, block BlockCrypt) *UDPSession {
+func NewUDPSession(
+	writer func(b []byte) (n int, err error),
+	conv uint32,
+	dataShards,
+	parityShards int,
+	block BlockCrypt,
+) *UDPSession {
 	sess := new(UDPSession)
 	sess.die = make(chan struct{})
 	sess.nonce = new(nonceAES128)
+	sess.writer = writer
 	sess.nonce.Init()
 	sess.chReadEvent = make(chan struct{}, 1)
 	sess.chWriteEvent = make(chan struct{}, 1)
 	sess.chSocketReadError = make(chan struct{})
 	sess.chSocketWriteError = make(chan struct{})
-	sess.remote = remote
-	sess.conn = conn
 	sess.block = block
 	sess.recvbuf = make([]byte, mtuLimit)
-
-	// cast to writebatch conn
-	if _, ok := conn.(*net.UDPConn); ok {
-		addr, err := net.ResolveUDPAddr("udp", conn.LocalAddr().String())
-		if err == nil {
-			if addr.IP.To4() != nil {
-				sess.xconn = ipv4.NewPacketConn(conn)
-			} else {
-				sess.xconn = ipv6.NewPacketConn(conn)
-			}
-		}
-	}
 
 	// FEC codec initialization
 	sess.fecDecoder = newFECDecoder(rxFECMulti*(dataShards+parityShards), dataShards, parityShards)
@@ -175,8 +164,6 @@ func NewUDPSession(conv uint32, dataShards, parityShards int, conn net.PacketCon
 	// register current session to the global updater,
 	// which call sess.update() periodically.
 	updater.addSession(sess)
-
-	go sess.readLoop()
 
 	currestab := atomic.AddUint64(&DefaultSnmp.CurrEstab, 1)
 	maxconn := atomic.LoadUint64(&DefaultSnmp.MaxConn)
@@ -341,17 +328,12 @@ func (s *UDPSession) Close() error {
 		updater.removeSession(s)
 		atomic.AddUint64(&DefaultSnmp.CurrEstab, ^uint64(0))
 
-		return s.conn.Close()
+		// return s.conn.Close()
+		return nil
 	} else {
 		return errors.WithStack(io.ErrClosedPipe)
 	}
 }
-
-// LocalAddr returns the local network address. The Addr returned is shared by all invocations of LocalAddr, so do not modify it.
-func (s *UDPSession) LocalAddr() net.Addr { return s.conn.LocalAddr() }
-
-// RemoteAddr returns the remote network address. The Addr returned is shared by all invocations of RemoteAddr, so do not modify it.
-func (s *UDPSession) RemoteAddr() net.Addr { return s.remote }
 
 // SetDeadline sets the deadline associated with the listener. A zero time value disables the deadline.
 func (s *UDPSession) SetDeadline(t time.Time) error {
@@ -445,21 +427,25 @@ func (s *UDPSession) SetNoDelay(nodelay, interval, resend, nc int) {
 
 // SetReadBuffer sets the socket read buffer
 func (s *UDPSession) SetReadBuffer(bytes int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if nc, ok := s.conn.(setReadBuffer); ok {
-		return nc.SetReadBuffer(bytes)
-	}
+	/*
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if nc, ok := s.conn.(setReadBuffer); ok {
+			return nc.SetReadBuffer(bytes)
+		}
+	*/
 	return errInvalidOperation
 }
 
 // SetWriteBuffer sets the socket write buffer, no effect if it's accepted from Listener
 func (s *UDPSession) SetWriteBuffer(bytes int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if nc, ok := s.conn.(setWriteBuffer); ok {
-		return nc.SetWriteBuffer(bytes)
-	}
+	/*
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if nc, ok := s.conn.(setWriteBuffer); ok {
+			return nc.SetWriteBuffer(bytes)
+		}
+	*/
 	return errInvalidOperation
 }
 
@@ -493,21 +479,16 @@ func (s *UDPSession) output(buf []byte) {
 	}
 
 	// 4. TxQueue
-	var msg ipv4.Message
 	for i := 0; i < s.dup+1; i++ {
 		bts := xmitBuf.Get().([]byte)[:len(buf)]
 		copy(bts, buf)
-		msg.Buffers = [][]byte{bts}
-		msg.Addr = s.remote
-		s.txqueue = append(s.txqueue, msg)
+		s.txqueue = append(s.txqueue, bts)
 	}
 
 	for k := range ecc {
 		bts := xmitBuf.Get().([]byte)[:len(ecc[k])]
 		copy(bts, ecc[k])
-		msg.Buffers = [][]byte{bts}
-		msg.Addr = s.remote
-		s.txqueue = append(s.txqueue, msg)
+		s.txqueue = append(s.txqueue, bts)
 	}
 }
 
@@ -662,7 +643,11 @@ func (s *UDPSession) kcpInput(data []byte) {
 	if fecRecovered > 0 {
 		atomic.AddUint64(&DefaultSnmp.FECRecovered, fecRecovered)
 	}
+}
 
+// RxPacket processes an incoming packet.
+func (s *UDPSession) RxPacket(data []byte) {
+	s.packetInput(data)
 }
 
 type (
