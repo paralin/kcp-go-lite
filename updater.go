@@ -10,7 +10,6 @@ var updater updateHeap
 
 func init() {
 	updater.init()
-	go updater.updateTask()
 }
 
 // entry contains a session update info
@@ -23,6 +22,7 @@ type entry struct {
 type updateHeap struct {
 	entries  []entry
 	mu       sync.Mutex
+	gcCount  int
 	chWakeUp chan struct{}
 }
 
@@ -55,6 +55,10 @@ func (h *updateHeap) init() {
 
 func (h *updateHeap) addSession(s *UDPSession) {
 	h.mu.Lock()
+	if h.gcCount == 0 {
+		go h.updateTask()
+	}
+	h.gcCount++
 	heap.Push(h, entry{time.Now(), s})
 	h.mu.Unlock()
 	h.wakeup()
@@ -64,6 +68,9 @@ func (h *updateHeap) removeSession(s *UDPSession) {
 	h.mu.Lock()
 	if s.updaterIdx != -1 {
 		heap.Remove(h, s.updaterIdx)
+	}
+	if h.gcCount > 0 {
+		h.gcCount--
 	}
 	h.mu.Unlock()
 }
@@ -84,6 +91,11 @@ func (h *updateHeap) updateTask() {
 		}
 
 		h.mu.Lock()
+		if h.gcCount == 0 {
+			h.entries = nil
+			h.mu.Unlock()
+			return
+		}
 		hlen := h.Len()
 		for i := 0; i < hlen; i++ {
 			entry := &h.entries[0]
